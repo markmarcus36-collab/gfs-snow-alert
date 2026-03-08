@@ -48,6 +48,8 @@ jobs:
       # 6. Run the snow alert script
       - name: Run GFS snow alert
         run: python gfs_snow_alert.py
+        env:
+          TEST_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
 
       # 7. The cache action automatically saves on job success,
       #    so the updated last_alerted_run.txt will persist to the next run.

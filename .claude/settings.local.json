@@ -27,7 +27,9 @@
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832183565)",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832183565 --log)",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832277144)",
-      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832277144 --log)"
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832277144 --log)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832395105)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832395105 --log)"
     ]
   }
 }

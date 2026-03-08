@@ -406,8 +406,12 @@ def main() -> None:
     gmail_pass = get_env_var("GMAIL_APP_PASSWORD")
     recipient = get_env_var("ALERT_RECIPIENT")
 
-    # Load previously alerted runs
-    alerted = load_alerted_runs()
+    # Load previously alerted runs (skip if TEST_RUN env var is set)
+    if os.environ.get("TEST_RUN"):
+        log.info("TEST_RUN mode — ignoring previous alerts.")
+        alerted = set()
+    else:
+        alerted = load_alerted_runs()
 
     # Find the latest available run
     latest = find_latest_available_run()
