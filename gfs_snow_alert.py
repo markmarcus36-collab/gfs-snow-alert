@@ -46,10 +46,10 @@ SUBREGION = {
     "bottomlat": 39.7,
 }
 
-# WEASD (Water Equivalent of Accumulated Snow Depth) is in kg/m².
-# To convert to approximate inches of snow, assume 10:1 snow ratio:
-# kg/m² = mm water, × 10 for snow depth in mm, / 25.4 for inches.
-SNOW_RATIO = 10.0
+# WEASD (Water Equivalent of Accumulated Snow Depth) is in kg/m² (= mm water).
+# To convert to inches of snow: mm_water × snow_ratio / mm_per_inch.
+# A 25:1 ratio is typical for dry/average snow in the northeast US.
+SNOW_RATIO = 25.0
 MM_PER_INCH = 25.4
 
 # File used to track the last alerted run (persisted via GitHub Actions cache)
@@ -260,27 +260,20 @@ def send_email(
     date_str = run_id[:8]  # e.g. '20260308'
     formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
 
-    # Build snow info lines
-    snow_lines = []
-    if "weasd" in snow_data:
-        weasd_mm = snow_data["weasd"]  # kg/m² = mm water equivalent
-        snow_inches = weasd_mm * SNOW_RATIO / MM_PER_INCH
-        snow_lines.append(f"Water equiv snow depth (WEASD): {weasd_mm:.2f} kg/m²")
-        snow_lines.append(f"Estimated snow depth (10:1):    {snow_inches:.2f} inches")
-    if "snod" in snow_data:
-        snod_m = snow_data["snod"]
-        snod_inches = snod_m * 39.3701
-        snow_lines.append(f"Snow depth (SNOD):              {snod_m:.4f} m ({snod_inches:.2f} inches)")
+    # Compute snowfall in inches from WEASD
+    weasd_mm = snow_data.get("weasd", 0.0)  # kg/m² = mm water equivalent
+    snowfall_inches = weasd_mm * SNOW_RATIO / MM_PER_INCH
 
-    subject = f"GFS {cycle}Z Snow Alert \u2014 {formatted_date}"
+    subject = f"GFS {cycle}Z Snow Alert \u2014 {snowfall_inches:.1f}\" forecasted"
     body = (
         f"GFS Snow Forecast Alert\n"
         f"{'=' * 40}\n\n"
+        f"Snowfall:       {snowfall_inches:.1f} inches\n\n"
         f"Run cycle:      {formatted_date} {cycle}Z\n"
         f"Forecast hour:  {fhour}\n"
         f"Location:       New York, NY (40.7\u00b0N, 74.0\u00b0W)\n"
-        f"Grid spacing:   0.25\u00b0 (~28 km), nearest point\n\n"
-        + "\n".join(snow_lines) + "\n\n"
+        f"Grid spacing:   0.25\u00b0 (~28 km), nearest point\n"
+        f"WEASD:          {weasd_mm:.2f} kg/m\u00b2 (snow ratio {SNOW_RATIO:.0f}:1)\n\n"
         f"Source: NOAA GFS via NOMADS\n"
     )
 

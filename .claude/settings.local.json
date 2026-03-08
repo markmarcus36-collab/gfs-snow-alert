@@ -29,7 +29,13 @@
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832277144)",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832277144 --log)",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832395105)",
-      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832395105 --log)"
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832395105 --log)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832423520)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832423520 --log)",
+      "Bash(curl:*)",
+      "Bash(pip install:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)"
     ]
   }
 }
