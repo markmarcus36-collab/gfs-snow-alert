@@ -1,6 +1,6 @@
 name: GFS Snow Alert
 
-# Run every 30 minutes to catch new GFS cycles as they become available
+# Run every 30 minutes to catch new GFS cycles
 on:
   schedule:
     - cron: "*/30 * * * *"
