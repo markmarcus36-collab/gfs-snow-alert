@@ -218,17 +218,20 @@ def extract_snowfall(grib_path: str) -> dict | None:
     result = {}
     for ds in datasets:
         log.info("Dataset vars: %s", list(ds.data_vars))
+        # cfgrib renames WEASD → sdwe, SNOD → sde
+        name_map = {"sdwe": "weasd", "weasd": "weasd", "sde": "snod", "snod": "snod"}
         for var_name in ds.data_vars:
             key = var_name.lower()
-            if key in ("weasd", "snod", "sd", "sde"):
+            if key in name_map:
                 try:
                     value = (
                         ds[var_name]
                         .sel(latitude=NYC_LAT, longitude=lon_360, method="nearest")
                         .values.item()
                     )
-                    result[key] = float(value)
-                    log.info("Extracted %s = %.4f", var_name, value)
+                    canonical = name_map[key]
+                    result[canonical] = float(value)
+                    log.info("Extracted %s (%s) = %.4f", var_name, canonical, value)
                 except Exception as exc:
                     log.warning("Failed to extract %s: %s", var_name, exc)
         ds.close()
@@ -367,8 +370,35 @@ def process_run(
     return False
 
 
+def find_latest_available_run() -> tuple[str, str] | None:
+    """
+    Find the latest GFS run that has data available on NOMADS.
+    Checks today and yesterday, most recent cycle first.
+    Returns (date_str, cycle) or None.
+    """
+    now = datetime.now(timezone.utc)
+    dates = [
+        now.strftime("%Y%m%d"),
+        (now - timedelta(days=1)).strftime("%Y%m%d"),
+    ]
+
+    # Check most recent cycles first
+    for date_str in dates:
+        for cycle in reversed(GFS_CYCLES):
+            if not is_run_likely_available(date_str, cycle):
+                continue
+            # Quick check: try to download the shortest forecast hour
+            url = build_nomads_url(date_str, cycle, FORECAST_HOURS[-1])
+            grib_path = download_grib(url)
+            if grib_path is not None:
+                os.unlink(grib_path)
+                log.info("Latest available run: %s %sZ", date_str, cycle)
+                return (date_str, cycle)
+    return None
+
+
 def main() -> None:
-    """Entry point: check recent GFS runs and send alerts for any new ones."""
+    """Entry point: find the latest GFS run and send one alert."""
     log.info("=== gfs-snow-alert starting ===")
 
     # Load email credentials from environment
@@ -379,31 +409,20 @@ def main() -> None:
     # Load previously alerted runs
     alerted = load_alerted_runs()
 
-    # Determine which dates/cycles to check.
-    # We look at today and yesterday (UTC) to catch any runs we may have missed.
-    now = datetime.now(timezone.utc)
-    dates_to_check = [
-        (now - timedelta(days=1)).strftime("%Y%m%d"),
-        now.strftime("%Y%m%d"),
-    ]
+    # Find the latest available run
+    latest = find_latest_available_run()
+    if latest is None:
+        log.info("No GFS runs available right now.")
+        log.info("=== gfs-snow-alert finished ===")
+        return
 
-    state_changed = False
+    date_str, cycle = latest
 
-    for date_str in dates_to_check:
-        for cycle in GFS_CYCLES:
-            try:
-                if process_run(
-                    date_str, cycle, alerted,
-                    gmail_addr, gmail_pass, recipient,
-                ):
-                    state_changed = True
-            except Exception as exc:
-                # Catch-all so one bad run doesn't block the others
-                log.error("Unexpected error processing %s %sZ: %s", date_str, cycle, exc)
-
-    # Persist state if anything changed
-    if state_changed:
-        save_alerted_runs(alerted)
+    try:
+        if process_run(date_str, cycle, alerted, gmail_addr, gmail_pass, recipient):
+            save_alerted_runs(alerted)
+    except Exception as exc:
+        log.error("Unexpected error processing %s %sZ: %s", date_str, cycle, exc)
 
     log.info("=== gfs-snow-alert finished ===")
 
