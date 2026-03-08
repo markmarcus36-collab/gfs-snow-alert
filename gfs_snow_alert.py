@@ -27,8 +27,9 @@ import xarray as xr
 # GFS cycles to monitor (UTC hours)
 GFS_CYCLES = ["00", "06", "12", "18"]
 
-# Forecast hour to pull (hour 384 = 16-day forecast, the max GFS range)
-FORECAST_HOUR = 384
+# Forecast hours to try (descending). GFS goes up to 384 but later hours
+# may not be published yet. We try the longest first and fall back.
+FORECAST_HOURS = [384, 336, 240, 120]
 
 # New York City coordinates
 NYC_LAT = 40.7
@@ -129,22 +130,13 @@ def is_run_likely_available(date_str: str, cycle: str) -> bool:
     return True
 
 
-def build_nomads_url(date_str: str, cycle: str) -> str:
+def build_nomads_url(date_str: str, cycle: str, fhour: int) -> str:
     """
-    Build the NOMADS grib-filter URL to download only the ASNOW field
-    for hour 384 from the pgrb2b 0.25° file, subsetted to the NYC area.
-
-    Example result:
-      https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25b.pl?
-        file=gfs.t00z.pgrb2b.0p25.f384
-        &var_ASNOW=on
-        &lev_surface=on
-        &subregion=
-        &leftlon=-75&rightlon=-73&toplat=41.7&bottomlat=39.7
-        &dir=/gfs.20260308/00/atmos
+    Build the NOMADS grib-filter URL to download WEASD and SNOD fields
+    from the primary pgrb2 0.25° file, subsetted to the NYC area.
     """
     params = {
-        "file": f"gfs.t{cycle}z.pgrb2.0p25.f{FORECAST_HOUR:03d}",
+        "file": f"gfs.t{cycle}z.pgrb2.0p25.f{fhour:03d}",
         "var_WEASD": "on",
         "var_SNOD": "on",
         "lev_surface": "on",
@@ -252,6 +244,7 @@ def send_email(
     run_id: str,
     cycle: str,
     snow_data: dict,
+    fhour: int,
     gmail_addr: str,
     gmail_pass: str,
     recipient: str,
@@ -281,7 +274,7 @@ def send_email(
         f"GFS Snow Forecast Alert\n"
         f"{'=' * 40}\n\n"
         f"Run cycle:      {formatted_date} {cycle}Z\n"
-        f"Forecast hour:  {FORECAST_HOUR} (16-day total)\n"
+        f"Forecast hour:  {fhour}\n"
         f"Location:       New York, NY (40.7\u00b0N, 74.0\u00b0W)\n"
         f"Grid spacing:   0.25\u00b0 (~28 km), nearest point\n\n"
         + "\n".join(snow_lines) + "\n\n"
@@ -334,12 +327,21 @@ def process_run(
     if not is_run_likely_available(date_str, cycle):
         return False
 
-    # Build URL and download the GRIB subset
-    url = build_nomads_url(date_str, cycle)
-    grib_path = download_grib(url)
+    # Try forecast hours from longest to shortest until one works
+    grib_path = None
+    used_fhour = None
+    for fhour in FORECAST_HOURS:
+        url = build_nomads_url(date_str, cycle, fhour)
+        grib_path = download_grib(url)
+        if grib_path is not None:
+            used_fhour = fhour
+            break
+
     if grib_path is None:
-        log.info("Data for run %sZ not available yet.", run_id)
+        log.info("Data for run %sZ not available at any forecast hour.", run_id)
         return False
+
+    log.info("Using forecast hour %d for run %sZ.", used_fhour, run_id)
 
     # Extract the snowfall value
     try:
@@ -358,7 +360,7 @@ def process_run(
     log.info("Run %sZ snow data: %s", run_id, snow_data)
 
     # Send the email (always, even if 0 inches)
-    if send_email(run_id, cycle, snow_data, gmail_addr, gmail_pass, recipient):
+    if send_email(run_id, cycle, snow_data, used_fhour, gmail_addr, gmail_pass, recipient):
         alerted.add(run_id)
         return True
 
