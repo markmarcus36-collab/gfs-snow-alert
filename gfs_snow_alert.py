@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+gfs-snow-alert: Fetch GFS accumulated snowfall (ASNOW) forecasts from NOAA NOMADS
+and send email alerts via Gmail SMTP.
+
+Checks all 4 daily GFS cycles (00Z, 06Z, 12Z, 18Z) for the hour-384 ASNOW field
+at the nearest grid point to New York City (40.7°N, 74.0°W).
+
+State is tracked in a text file so alerts are never sent twice for the same run.
+"""
+
+import os
+import sys
+import logging
+import smtplib
+import tempfile
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
+
+import requests
+import xarray as xr
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# GFS cycles to monitor (UTC hours)
+GFS_CYCLES = ["00", "06", "12", "18"]
+
+# Forecast hour to pull (hour 384 = 16-day forecast, the max GFS range)
+FORECAST_HOUR = 384
+
+# New York City coordinates
+NYC_LAT = 40.7
+NYC_LON = -74.0  # West longitude (negative)
+
+# NOMADS filter endpoint for pgrb2b files (ASNOW lives in the "b" secondary set)
+NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25b.pl"
+
+# Small bounding box around NYC for the subregion filter (±1°)
+SUBREGION = {
+    "leftlon":  -75.0,
+    "rightlon": -73.0,
+    "toplat":    41.7,
+    "bottomlat": 39.7,
+}
+
+# Conversion: ASNOW is in kg/m² (equivalent to mm of liquid water depth for snow).
+# To convert to inches of snow, divide by 25.4.
+KG_M2_TO_INCHES = 25.4
+
+# File used to track the last alerted run (persisted via GitHub Actions cache)
+STATE_FILE = "last_alerted_run.txt"
+
+# How many hours after cycle time GFS data typically becomes available
+MIN_DELAY_HOURS = 3.5
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def get_env_var(name: str) -> str:
+    """Read a required environment variable or exit with a clear message."""
+    value = os.environ.get(name)
+    if not value:
+        log.error("Missing required environment variable: %s", name)
+        sys.exit(1)
+    return value
+
+
+def load_alerted_runs() -> set[str]:
+    """
+    Load the set of already-alerted run identifiers from the state file.
+
+    Each line in the file is a run ID like '2026030800' (YYYYMMDDCC).
+    Returns an empty set if the file doesn't exist yet.
+    """
+    if not os.path.exists(STATE_FILE):
+        log.info("State file %s not found — starting fresh.", STATE_FILE)
+        return set()
+
+    with open(STATE_FILE, "r") as f:
+        runs = {line.strip() for line in f if line.strip()}
+    log.info("Loaded %d previously alerted run(s) from %s.", len(runs), STATE_FILE)
+    return runs
+
+
+def save_alerted_runs(runs: set[str]) -> None:
+    """Write the full set of alerted run IDs back to the state file."""
+    with open(STATE_FILE, "w") as f:
+        for run_id in sorted(runs):
+            f.write(run_id + "\n")
+    log.info("Saved %d alerted run(s) to %s.", len(runs), STATE_FILE)
+
+
+def is_run_likely_available(date_str: str, cycle: str) -> bool:
+    """
+    Return True if enough time has passed since the cycle for data to be online.
+
+    GFS data for a given cycle usually appears on NOMADS about 3.5–5 hours after
+    the cycle time.  We use a 3.5-hour minimum delay as the threshold.
+    """
+    cycle_time = datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(
+        tzinfo=timezone.utc
+    )
+    now = datetime.now(timezone.utc)
+    hours_since = (now - cycle_time).total_seconds() / 3600.0
+
+    if hours_since < MIN_DELAY_HOURS:
+        log.info(
+            "Cycle %s%sZ is only %.1f h old (need >= %.1f h) — skipping.",
+            date_str, cycle, hours_since, MIN_DELAY_HOURS,
+        )
+        return False
+    return True
+
+
+def build_nomads_url(date_str: str, cycle: str) -> str:
+    """
+    Build the NOMADS grib-filter URL to download only the ASNOW field
+    for hour 384 from the pgrb2b 0.25° file, subsetted to the NYC area.
+
+    Example result:
+      https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25b.pl?
+        file=gfs.t00z.pgrb2b.0p25.f384
+        &var_ASNOW=on
+        &lev_surface=on
+        &subregion=
+        &leftlon=-75&rightlon=-73&toplat=41.7&bottomlat=39.7
+        &dir=/gfs.20260308/00/atmos
+    """
+    params = {
+        "file": f"gfs.t{cycle}z.pgrb2b.0p25.f{FORECAST_HOUR:03d}",
+        "var_ASNOW": "on",
+        "lev_surface": "on",
+        "subregion": "",
+        "leftlon": str(SUBREGION["leftlon"]),
+        "rightlon": str(SUBREGION["rightlon"]),
+        "toplat": str(SUBREGION["toplat"]),
+        "bottomlat": str(SUBREGION["bottomlat"]),
+        "dir": f"/gfs.{date_str}/{cycle}/atmos",
+    }
+    # Build query string manually to preserve the empty 'subregion=' param
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{NOMADS_BASE}?{query}"
+
+
+def download_grib(url: str) -> str | None:
+    """
+    Download the GRIB2 data from NOMADS into a temporary file.
+
+    Returns the path to the temp file on success, or None if the data
+    is not yet available (HTTP 404 or other error).
+    """
+    log.info("Requesting: %s", url)
+    try:
+        resp = requests.get(url, timeout=60)
+    except requests.RequestException as exc:
+        log.warning("Network error downloading GRIB data: %s", exc)
+        return None
+
+    if resp.status_code == 404:
+        log.info("Data not available yet (HTTP 404).")
+        return None
+
+    if resp.status_code != 200:
+        log.warning("Unexpected HTTP status %d from NOMADS.", resp.status_code)
+        return None
+
+    # NOMADS returns an HTML error page (not GRIB) when the file doesn't exist
+    content_type = resp.headers.get("Content-Type", "")
+    if "html" in content_type.lower():
+        log.info("Received HTML instead of GRIB — data not available yet.")
+        return None
+
+    if len(resp.content) < 100:
+        log.info("Response too small (%d bytes) — likely not valid GRIB.", len(resp.content))
+        return None
+
+    # Write to a temporary file so cfgrib can read it
+    tmp = tempfile.NamedTemporaryFile(suffix=".grib2", delete=False)
+    tmp.write(resp.content)
+    tmp.close()
+    log.info("Downloaded %d bytes to %s.", len(resp.content), tmp.name)
+    return tmp.name
+
+
+def extract_snowfall(grib_path: str) -> float | None:
+    """
+    Open the GRIB2 file with cfgrib/xarray and extract the ASNOW value
+    at the grid point nearest to NYC.
+
+    Returns snowfall in kg/m², or None on failure.
+    """
+    try:
+        ds = xr.open_dataset(
+            grib_path,
+            engine="cfgrib",
+        )
+    except Exception as exc:
+        log.error("Failed to open GRIB file: %s", exc)
+        return None
+
+    # cfgrib exposes ASNOW under its short name; find it
+    # Possible variable names: 'asnow', 'ASNOW', or paramId-based
+    var_name = None
+    for name in ds.data_vars:
+        if name.lower() == "asnow" or "snow" in name.lower():
+            var_name = name
+            break
+
+    if var_name is None:
+        log.error(
+            "ASNOW variable not found in dataset. Available vars: %s",
+            list(ds.data_vars),
+        )
+        ds.close()
+        return None
+
+    log.info("Using variable '%s' from GRIB file.", var_name)
+
+    # NOMADS longitudes are 0–360; convert NYC's western longitude
+    lon_360 = NYC_LON % 360  # -74.0 → 286.0
+
+    try:
+        value = (
+            ds[var_name]
+            .sel(latitude=NYC_LAT, longitude=lon_360, method="nearest")
+            .values.item()
+        )
+    except Exception as exc:
+        log.error("Failed to extract value at NYC grid point: %s", exc)
+        ds.close()
+        return None
+
+    ds.close()
+    log.info("Raw ASNOW value at nearest grid point: %.2f kg/m²", value)
+    return float(value)
+
+
+def send_email(
+    run_id: str,
+    cycle: str,
+    snowfall_inches: float,
+    gmail_addr: str,
+    gmail_pass: str,
+    recipient: str,
+) -> bool:
+    """
+    Send a snow-alert email via Gmail SMTP.
+
+    Returns True on success, False on failure.
+    """
+    date_str = run_id[:8]  # e.g. '20260308'
+    formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+    subject = f"GFS {cycle}Z Snow Alert \u2014 {formatted_date}"
+    body = (
+        f"GFS Snow Forecast Alert\n"
+        f"{'=' * 40}\n\n"
+        f"Run cycle:      {formatted_date} {cycle}Z\n"
+        f"Forecast hour:  {FORECAST_HOUR} (16-day total)\n"
+        f"Location:       New York, NY (40.7\u00b0N, 74.0\u00b0W)\n"
+        f"Grid spacing:   0.25\u00b0 (~28 km), nearest point\n\n"
+        f"Accumulated snowfall (ASNOW): {snowfall_inches:.2f} inches\n\n"
+        f"Source: NOAA GFS via NOMADS\n"
+    )
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = gmail_addr
+    msg["To"] = recipient
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(gmail_addr, gmail_pass)
+            server.sendmail(gmail_addr, [recipient], msg.as_string())
+        log.info("Email sent to %s for run %s.", recipient, run_id)
+        return True
+    except smtplib.SMTPException as exc:
+        log.error("Failed to send email: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+
+def process_run(
+    date_str: str,
+    cycle: str,
+    alerted: set[str],
+    gmail_addr: str,
+    gmail_pass: str,
+    recipient: str,
+) -> bool:
+    """
+    Check one GFS run: download data, extract snowfall, email, update state.
+
+    Returns True if an alert was successfully sent (state should be saved).
+    """
+    run_id = f"{date_str}{cycle}"
+
+    # Already alerted?
+    if run_id in alerted:
+        log.info("Run %sZ already alerted — skipping.", run_id)
+        return False
+
+    # Too early for data to be available?
+    if not is_run_likely_available(date_str, cycle):
+        return False
+
+    # Build URL and download the GRIB subset
+    url = build_nomads_url(date_str, cycle)
+    grib_path = download_grib(url)
+    if grib_path is None:
+        log.info("Data for run %sZ not available yet.", run_id)
+        return False
+
+    # Extract the snowfall value
+    try:
+        snowfall_kgm2 = extract_snowfall(grib_path)
+    finally:
+        # Clean up the temp file
+        try:
+            os.unlink(grib_path)
+        except OSError:
+            pass
+
+    if snowfall_kgm2 is None:
+        log.warning("Could not extract snowfall for run %sZ.", run_id)
+        return False
+
+    # Convert kg/m² → inches
+    snowfall_inches = snowfall_kgm2 / KG_M2_TO_INCHES
+
+    log.info(
+        "Run %sZ: ASNOW = %.2f kg/m² = %.2f inches.",
+        run_id, snowfall_kgm2, snowfall_inches,
+    )
+
+    # Send the email (always, even if 0 inches)
+    if send_email(run_id, cycle, snowfall_inches, gmail_addr, gmail_pass, recipient):
+        alerted.add(run_id)
+        return True
+
+    return False
+
+
+def main() -> None:
+    """Entry point: check recent GFS runs and send alerts for any new ones."""
+    log.info("=== gfs-snow-alert starting ===")
+
+    # Load email credentials from environment
+    gmail_addr = get_env_var("GMAIL_ADDRESS")
+    gmail_pass = get_env_var("GMAIL_APP_PASSWORD")
+    recipient = get_env_var("ALERT_RECIPIENT")
+
+    # Load previously alerted runs
+    alerted = load_alerted_runs()
+
+    # Determine which dates/cycles to check.
+    # We look at today and yesterday (UTC) to catch any runs we may have missed.
+    now = datetime.now(timezone.utc)
+    dates_to_check = [
+        (now - timedelta(days=1)).strftime("%Y%m%d"),
+        now.strftime("%Y%m%d"),
+    ]
+
+    state_changed = False
+
+    for date_str in dates_to_check:
+        for cycle in GFS_CYCLES:
+            try:
+                if process_run(
+                    date_str, cycle, alerted,
+                    gmail_addr, gmail_pass, recipient,
+                ):
+                    state_changed = True
+            except Exception as exc:
+                # Catch-all so one bad run doesn't block the others
+                log.error("Unexpected error processing %s %sZ: %s", date_str, cycle, exc)
+
+    # Persist state if anything changed
+    if state_changed:
+        save_alerted_runs(alerted)
+
+    log.info("=== gfs-snow-alert finished ===")
+
+
+if __name__ == "__main__":
+    main()

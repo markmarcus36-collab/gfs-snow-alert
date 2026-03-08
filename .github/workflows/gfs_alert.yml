@@ -1,0 +1,53 @@
+name: GFS Snow Alert
+
+# Run every 30 minutes to catch new GFS cycles as they become available
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: # Allow manual runs from the Actions tab
+
+jobs:
+  check-gfs:
+    runs-on: ubuntu-latest
+
+    # Pass email secrets as environment variables
+    env:
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      ALERT_RECIPIENT: ${{ secrets.ALERT_RECIPIENT }}
+
+    steps:
+      # 1. Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install the eccodes C library (required by cfgrib)
+      - name: Install eccodes system library
+        run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
+
+      # 4. Install Python dependencies
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # 5. Restore the tracking file from cache (if it exists)
+      #    The cache key uses a rolling 3-day window so old state eventually expires.
+      - name: Restore alert state cache
+        uses: actions/cache@v4
+        with:
+          path: last_alerted_run.txt
+          key: gfs-alert-state-${{ github.run_id }}
+          restore-keys: |
+            gfs-alert-state-
+
+      # 6. Run the snow alert script
+      - name: Run GFS snow alert
+        run: python gfs_snow_alert.py
+
+      # 7. The cache action automatically saves on job success,
+      #    so the updated last_alerted_run.txt will persist to the next run.
