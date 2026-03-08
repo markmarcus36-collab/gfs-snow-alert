@@ -48,8 +48,8 @@ SUBREGION = {
 
 # WEASD (Water Equivalent of Accumulated Snow Depth) is in kg/m² (= mm water).
 # To convert to inches of snow: mm_water × snow_ratio / mm_per_inch.
-# A 25:1 ratio is typical for dry/average snow in the northeast US.
-SNOW_RATIO = 25.0
+# 10:1 is the standard snow-to-liquid ratio used by NWS and weather models.
+SNOW_RATIO = 10.0
 MM_PER_INCH = 25.4
 
 # File used to track the last alerted run (persisted via GitHub Actions cache)
