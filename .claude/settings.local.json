@@ -21,7 +21,11 @@
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" secret set GMAIL_ADDRESS --body \"markmarcus36@gmail.com\")",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" secret set GMAIL_APP_PASSWORD --body \"tbta olxw uyyd fkop\")",
       "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" secret set ALERT_RECIPIENT --body \"markmarcus36@gmail.com\")",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" workflow run \"GFS Snow Alert\")",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run list --limit 1)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run watch 22832183565)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" run view 22832183565 --log)"
     ]
   }
 }

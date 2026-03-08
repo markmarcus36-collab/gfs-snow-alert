@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-gfs-snow-alert: Fetch GFS accumulated snowfall (ASNOW) forecasts from NOAA NOMADS
+gfs-snow-alert: Fetch GFS snow forecasts (WEASD/SNOD) from NOAA NOMADS
 and send email alerts via Gmail SMTP.
 
-Checks all 4 daily GFS cycles (00Z, 06Z, 12Z, 18Z) for the hour-384 ASNOW field
+Checks all 4 daily GFS cycles (00Z, 06Z, 12Z, 18Z) for hour-384 snow fields
 at the nearest grid point to New York City (40.7°N, 74.0°W).
 
 State is tracked in a text file so alerts are never sent twice for the same run.
@@ -34,8 +34,8 @@ FORECAST_HOUR = 384
 NYC_LAT = 40.7
 NYC_LON = -74.0  # West longitude (negative)
 
-# NOMADS filter endpoint for pgrb2b files (ASNOW lives in the "b" secondary set)
-NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25b.pl"
+# NOMADS filter endpoint for primary pgrb2 files
+NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 
 # Small bounding box around NYC for the subregion filter (±1°)
 SUBREGION = {
@@ -45,9 +45,11 @@ SUBREGION = {
     "bottomlat": 39.7,
 }
 
-# Conversion: ASNOW is in kg/m² (equivalent to mm of liquid water depth for snow).
-# To convert to inches of snow, divide by 25.4.
-KG_M2_TO_INCHES = 25.4
+# WEASD (Water Equivalent of Accumulated Snow Depth) is in kg/m².
+# To convert to approximate inches of snow, assume 10:1 snow ratio:
+# kg/m² = mm water, × 10 for snow depth in mm, / 25.4 for inches.
+SNOW_RATIO = 10.0
+MM_PER_INCH = 25.4
 
 # File used to track the last alerted run (persisted via GitHub Actions cache)
 STATE_FILE = "last_alerted_run.txt"
@@ -142,8 +144,9 @@ def build_nomads_url(date_str: str, cycle: str) -> str:
         &dir=/gfs.20260308/00/atmos
     """
     params = {
-        "file": f"gfs.t{cycle}z.pgrb2b.0p25.f{FORECAST_HOUR:03d}",
-        "var_ASNOW": "on",
+        "file": f"gfs.t{cycle}z.pgrb2.0p25.f{FORECAST_HOUR:03d}",
+        "var_WEASD": "on",
+        "var_SNOD": "on",
         "lev_surface": "on",
         "subregion": "",
         "leftlon": str(SUBREGION["leftlon"]),
@@ -197,63 +200,58 @@ def download_grib(url: str) -> str | None:
     return tmp.name
 
 
-def extract_snowfall(grib_path: str) -> float | None:
+def extract_snowfall(grib_path: str) -> dict | None:
     """
-    Open the GRIB2 file with cfgrib/xarray and extract the ASNOW value
+    Open the GRIB2 file with cfgrib/xarray and extract WEASD and SNOD
     at the grid point nearest to NYC.
 
-    Returns snowfall in kg/m², or None on failure.
+    Returns a dict with 'weasd' (kg/m²) and 'snod' (m), or None on failure.
     """
     try:
-        ds = xr.open_dataset(
+        datasets = xr.open_datasets(
             grib_path,
             engine="cfgrib",
         )
-    except Exception as exc:
-        log.error("Failed to open GRIB file: %s", exc)
-        return None
-
-    # cfgrib exposes ASNOW under its short name; find it
-    # Possible variable names: 'asnow', 'ASNOW', or paramId-based
-    var_name = None
-    for name in ds.data_vars:
-        if name.lower() == "asnow" or "snow" in name.lower():
-            var_name = name
-            break
-
-    if var_name is None:
-        log.error(
-            "ASNOW variable not found in dataset. Available vars: %s",
-            list(ds.data_vars),
-        )
-        ds.close()
-        return None
-
-    log.info("Using variable '%s' from GRIB file.", var_name)
+    except Exception:
+        # Fallback for older xarray versions
+        try:
+            datasets = [xr.open_dataset(grib_path, engine="cfgrib")]
+        except Exception as exc:
+            log.error("Failed to open GRIB file: %s", exc)
+            return None
 
     # NOMADS longitudes are 0–360; convert NYC's western longitude
     lon_360 = NYC_LON % 360  # -74.0 → 286.0
 
-    try:
-        value = (
-            ds[var_name]
-            .sel(latitude=NYC_LAT, longitude=lon_360, method="nearest")
-            .values.item()
-        )
-    except Exception as exc:
-        log.error("Failed to extract value at NYC grid point: %s", exc)
+    result = {}
+    for ds in datasets:
+        log.info("Dataset vars: %s", list(ds.data_vars))
+        for var_name in ds.data_vars:
+            key = var_name.lower()
+            if key in ("weasd", "snod", "sd", "sde"):
+                try:
+                    value = (
+                        ds[var_name]
+                        .sel(latitude=NYC_LAT, longitude=lon_360, method="nearest")
+                        .values.item()
+                    )
+                    result[key] = float(value)
+                    log.info("Extracted %s = %.4f", var_name, value)
+                except Exception as exc:
+                    log.warning("Failed to extract %s: %s", var_name, exc)
         ds.close()
+
+    if not result:
+        log.error("No snow variables found in GRIB data.")
         return None
 
-    ds.close()
-    log.info("Raw ASNOW value at nearest grid point: %.2f kg/m²", value)
-    return float(value)
+    return result
 
 
 def send_email(
     run_id: str,
     cycle: str,
-    snowfall_inches: float,
+    snow_data: dict,
     gmail_addr: str,
     gmail_pass: str,
     recipient: str,
@@ -266,6 +264,18 @@ def send_email(
     date_str = run_id[:8]  # e.g. '20260308'
     formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
 
+    # Build snow info lines
+    snow_lines = []
+    if "weasd" in snow_data:
+        weasd_mm = snow_data["weasd"]  # kg/m² = mm water equivalent
+        snow_inches = weasd_mm * SNOW_RATIO / MM_PER_INCH
+        snow_lines.append(f"Water equiv snow depth (WEASD): {weasd_mm:.2f} kg/m²")
+        snow_lines.append(f"Estimated snow depth (10:1):    {snow_inches:.2f} inches")
+    if "snod" in snow_data:
+        snod_m = snow_data["snod"]
+        snod_inches = snod_m * 39.3701
+        snow_lines.append(f"Snow depth (SNOD):              {snod_m:.4f} m ({snod_inches:.2f} inches)")
+
     subject = f"GFS {cycle}Z Snow Alert \u2014 {formatted_date}"
     body = (
         f"GFS Snow Forecast Alert\n"
@@ -274,7 +284,7 @@ def send_email(
         f"Forecast hour:  {FORECAST_HOUR} (16-day total)\n"
         f"Location:       New York, NY (40.7\u00b0N, 74.0\u00b0W)\n"
         f"Grid spacing:   0.25\u00b0 (~28 km), nearest point\n\n"
-        f"Accumulated snowfall (ASNOW): {snowfall_inches:.2f} inches\n\n"
+        + "\n".join(snow_lines) + "\n\n"
         f"Source: NOAA GFS via NOMADS\n"
     )
 
@@ -333,7 +343,7 @@ def process_run(
 
     # Extract the snowfall value
     try:
-        snowfall_kgm2 = extract_snowfall(grib_path)
+        snow_data = extract_snowfall(grib_path)
     finally:
         # Clean up the temp file
         try:
@@ -341,20 +351,14 @@ def process_run(
         except OSError:
             pass
 
-    if snowfall_kgm2 is None:
+    if snow_data is None:
         log.warning("Could not extract snowfall for run %sZ.", run_id)
         return False
 
-    # Convert kg/m² → inches
-    snowfall_inches = snowfall_kgm2 / KG_M2_TO_INCHES
-
-    log.info(
-        "Run %sZ: ASNOW = %.2f kg/m² = %.2f inches.",
-        run_id, snowfall_kgm2, snowfall_inches,
-    )
+    log.info("Run %sZ snow data: %s", run_id, snow_data)
 
     # Send the email (always, even if 0 inches)
-    if send_email(run_id, cycle, snowfall_inches, gmail_addr, gmail_pass, recipient):
+    if send_email(run_id, cycle, snow_data, gmail_addr, gmail_pass, recipient):
         alerted.add(run_id)
         return True
 
